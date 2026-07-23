@@ -22,9 +22,9 @@ load_dotenv(override=True)
 
 # --- Configuration ---
 MODELS = {
-    "planner": "qwen/qwen3-27b",
-    "researcher": "llama-3.3-70b-versatile",
-    "writer": "qwen/qwen3-27b",
+    "planner": "qwen/qwen3.6-27b",
+    "researcher": "qwen/qwen3.6-27b",
+    "writer": "qwen/qwen3.6-27b",
 }
 
 DEV_CONFIG = {
@@ -38,17 +38,24 @@ DEV_CONFIG = {
 # --- LLM Setup ---
 @st.cache_resource
 def get_llms():
+    import os
+    load_dotenv(override=True)
+
     planner_llm = init_chat_model(
         model=MODELS["planner"],
         model_provider="groq",
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     researcher_llm = init_chat_model(
         model=MODELS["researcher"],
         model_provider="groq",
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     writer_llm = init_chat_model(
         model=MODELS["writer"],
         model_provider="groq",
+        api_key=os.getenv("GROQ_API_KEY"),
+        max_tokens=4096,
     )
     return planner_llm, researcher_llm, writer_llm
 
@@ -112,6 +119,7 @@ Rules:
 - Do not copy source text verbatim.
 - Use tools at most ONCE. Do not make follow-up searches.
 - If evidence is insufficient, explicitly state what is missing.
+- Do NOT include any thinking, reasoning, or chain-of-thought in your output.
 
 Output format:
 - Finding 1
@@ -155,9 +163,19 @@ Format:
 # --- Graph Nodes ---
 def build_graph(planner_llm, researcher_llm, writer_llm, progress_callback=None):
     """Build the research graph with all nodes and edges."""
+    import os
 
-    tavily_tool = TavilySearch(max_results=DEV_CONFIG["max_search_results"])
-    tools = [tavily_tool]
+    tavily_tool = TavilySearch(max_results=DEV_CONFIG["max_search_results"], api_key=os.getenv("TAVILY_API_KEY"))
+
+    # Wrap tavily to only accept 'query' param (prevents models from hallucinating extra params)
+    from langchain_core.tools import tool as tool_decorator
+
+    @tool_decorator
+    def web_search(query: str) -> str:
+        """Search the web for current information on a topic. Use this to find facts, comparisons, and recent data."""
+        return tavily_tool.invoke({"query": query})
+
+    tools = [web_search]
     researcher_with_tools = researcher_llm.bind_tools(tools)
     tool_node = ToolNode(tools)
 
@@ -271,6 +289,8 @@ Output ONLY bullet points. Maximum {DEV_CONFIG['max_finding_words']} words. Do n
 
         if "</think>" in content:
             content = content.split("</think>")[-1].strip()
+        if not content:
+            content = "Insufficient data to synthesize findings for this task."
 
         clean_response = AIMessage(content=content)
         return {
@@ -280,6 +300,16 @@ Output ONLY bullet points. Maximum {DEV_CONFIG['max_finding_words']} words. Do n
     def save_finding(state: State):
         task = state["plan"][state["current_task"]]
         final_answer = state["research_messages"][-1].content
+
+        # Strip thinking from final answer if it leaked through
+        if "</think>" in final_answer:
+            final_answer = final_answer.split("</think>")[-1].strip()
+        if "<think>" in final_answer:
+            final_answer = final_answer.split("<think>")[0].strip()
+
+        # Fallback if stripping made it empty
+        if not final_answer:
+            final_answer = "Insufficient data available for this specific task."
 
         if progress_callback:
             progress_callback("finding_saved", {
@@ -326,10 +356,25 @@ Output ONLY bullet points. Maximum {DEV_CONFIG['max_finding_words']} words. Do n
     def tools_wrapper(state: State):
         if progress_callback:
             progress_callback("tools", "Executing search...")
-        result = tool_node.invoke({"messages": state["research_messages"]})
-        return {
-            "research_messages": state["research_messages"] + [result["messages"][-1]],
-        }
+        try:
+            result = tool_node.invoke({"messages": state["research_messages"]})
+            return {
+                "research_messages": state["research_messages"] + [result["messages"][-1]],
+            }
+        except Exception as e:
+            # If tool execution fails, add error as tool message so flow continues
+            from langchain_core.messages import ToolMessage
+            last_msg = state["research_messages"][-1]
+            error_msgs = []
+            if hasattr(last_msg, "tool_calls"):
+                for tc in last_msg.tool_calls:
+                    error_msgs.append(ToolMessage(
+                        content=f"Search failed: {str(e)[:100]}",
+                        tool_call_id=tc["id"],
+                    ))
+            return {
+                "research_messages": state["research_messages"] + error_msgs,
+            }
 
     # --- Build Graph ---
     builder = StateGraph(State)
