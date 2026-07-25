@@ -9,3 +9,4 @@ wikipedia
 arxiv
 langchain-groq
 langchain-openai
+streamlit
